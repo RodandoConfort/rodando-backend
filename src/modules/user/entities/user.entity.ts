@@ -1,0 +1,104 @@
+import { AuthCredentials } from 'src/modules/user/entities/auth-credentials.entity';
+import { Session } from 'src/modules/auth/entities/session.entity';
+import { Vehicle } from 'src/modules/vehicles/entities/vehicle.entity';
+
+import {
+  Column,
+  CreateDateColumn,
+  DeleteDateColumn,
+  Entity,
+  Index,
+  OneToMany,
+  OneToOne,
+  Point,
+  //   ManyToOne,
+  PrimaryGeneratedColumn,
+  UpdateDateColumn,
+} from 'typeorm';
+import { DriverProfile } from 'src/modules/driver-profiles/entities/driver-profile.entity';
+
+export enum UserType {
+  PASSENGER = 'passenger',
+  DRIVER = 'driver',
+  ADMIN = 'admin',
+}
+
+export enum UserStatus {
+  ACTIVE = 'active',
+  INACTIVE = 'inactive',
+  BANNED = 'banned',
+}
+
+@Entity({ name: 'users' })
+@Index(['email'])
+@Index(['emailVerified'])
+@Index(['phoneNumber'])
+@Index(['phoneNumberVerified'])
+@Index(['userType'])
+export class User {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @OneToOne(() => AuthCredentials, (authCredentials) => authCredentials.user)
+  authCredentials: AuthCredentials;
+
+  @OneToOne(() => DriverProfile, (driverProfile) => driverProfile.user)
+  driverProfile: DriverProfile;
+
+  @OneToMany(() => Session, (session) => session.user)
+  sessions: Session[];
+
+  @Column({ length: 100 })
+  name: string;
+
+  @Column({ nullable: true, unique: true, length: 150 })
+  email?: string;
+
+  @Column({ default: false })
+  emailVerified: boolean;
+
+  @Column({ nullable: true, unique: true, length: 20 })
+  phoneNumber?: string;
+
+  @Column({ default: false })
+  phoneNumberVerified: boolean;
+
+  @Column({ type: 'enum', enum: UserType })
+  userType: UserType;
+
+  @Column({ nullable: true })
+  profilePictureUrl?: string;
+
+  @Column({
+    name: 'currentLocation',
+    type: 'geography',
+    spatialFeatureType: 'Point',
+    srid: 4326,
+    nullable: true,
+  })
+  currentLocation?: Point | null;
+
+  @OneToMany(() => Vehicle, (vehicle) => vehicle.driver)
+  vehicles: Vehicle[];
+
+  @Column({ type: 'enum', enum: UserStatus, default: UserStatus.ACTIVE })
+  status: UserStatus;
+
+  @Column({ nullable: true, length: 10 })
+  preferredLanguage?: string;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  termsAcceptedAt?: Date;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  privacyPolicyAcceptedAt?: Date;
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  createdAt: Date;
+
+  @UpdateDateColumn({ type: 'timestamptz' })
+  updatedAt: Date;
+
+  @DeleteDateColumn({ type: 'timestamptz', nullable: true })
+  deletedAt?: Date;
+}
