@@ -7,27 +7,36 @@ import { join } from 'path';
 export class DatabaseConfigService implements TypeOrmOptionsFactory {
   constructor(private readonly configService: ConfigService) {}
 
+  private bool(key: string, fallback = false): boolean {
+    const v = this.configService.get(key);
+
+    if (v === undefined || v === null) return fallback;
+    if (typeof v === 'boolean') return v;
+    if (typeof v === 'number') return v === 1;
+
+    if (typeof v === 'string') {
+      const s = v.toLowerCase().trim();
+      return ['true', '1', 'yes', 'y', 'on'].includes(s);
+    }
+
+    return fallback;
+  }
+
   createTypeOrmOptions(): TypeOrmModuleOptions {
     const nodeEnv = this.configService.get<string>('NODE_ENV', 'development');
     const isProd = nodeEnv === 'production';
 
     const databaseUrl = this.configService.get<string>('DATABASE_URL');
 
-    const runMigrations =
-      this.configService.get<string>('RUN_MIGRATIONS', 'false') === 'true';
-
-    const dbLogging =
-      this.configService.get<string>('DB_LOGGING', 'false') === 'true';
-
-    const dbSynchronize =
-      !isProd && this.configService.get<string>('DB_SYNCHRONIZE', 'false') === 'true';
+    // ✅ FIX: leer booleanos correctamente
+    const runMigrations = this.bool('RUN_MIGRATIONS', false);
+    const dbLogging = this.bool('DB_LOGGING', false);
+    const sslEnabled = this.bool('DB_SSL', false);
+    const dbSynchronize = !isProd && this.bool('DB_SYNCHRONIZE', false);
 
     const migrationsGlob = isProd
       ? join(__dirname, '..', 'migrations', '*.js')
       : join(__dirname, '..', 'migrations', '*.ts');
-
-    const sslEnabled =
-      this.configService.get<string>('DB_SSL', 'false') === 'true';
 
     const base: TypeOrmModuleOptions = {
       type: 'postgres',
