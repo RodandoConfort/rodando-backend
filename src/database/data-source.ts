@@ -25,7 +25,7 @@ if (error) throw new Error(`Config validation error: ${error.message}`);
 
 const isProd = env.NODE_ENV === 'production';
 
-export const AppDataSource = new DataSource({
+const dataSource = new DataSource({
   type: 'postgres',
   ...(env.DATABASE_URL
     ? { url: env.DATABASE_URL }
@@ -36,15 +36,10 @@ export const AppDataSource = new DataSource({
         password: env.DB_PASSWORD,
         database: env.DB_NAME,
       }),
-
   ...(env.DB_SSL ? { ssl: { rejectUnauthorized: false } } : {}),
-
   logging: env.DB_LOGGING,
   synchronize: false,
 
-  // OJO:
-  // - En dev, este archivo vive en la raíz => __dirname = raíz
-  // - En prod, vive en dist => __dirname = dist
   entities: [
     isProd
       ? join(__dirname, '**', '*.entity.js')
@@ -58,3 +53,5 @@ export const AppDataSource = new DataSource({
   migrationsRun: env.RUN_MIGRATIONS,
   migrationsTableName: 'migrations_history',
 });
+
+export default dataSource;
