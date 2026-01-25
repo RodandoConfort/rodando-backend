@@ -32,6 +32,15 @@ export class DatabaseModule {
               .valid('development', 'production', 'test')
               .default('development'),
 
+            // APP_ENV: Joi.string()
+            //   .valid('dev', 'staging', 'prod')
+            //   .default('dev'),
+            // MODE: Joi.string().valid('DEV', 'QA', 'PROD').default('DEV'),
+
+            // opcionales útiles
+            PORT: Joi.number().optional(),
+            CORS_ORIGINS: Joi.string().allow('').optional(),
+
             // Soporta DATABASE_URL (Render) o variables separadas (local/docker)
             DATABASE_URL: Joi.string().uri().optional(),
 
@@ -65,7 +74,7 @@ export class DatabaseModule {
             RUN_MIGRATIONS: Joi.boolean().default(false),
             DB_AUTO_CREATE: Joi.boolean().default(false),
             DB_SSL: Joi.boolean().default(false),
-          }),
+          }).unknown(true),
         }),
 
         TypeOrmModule.forRootAsync({
