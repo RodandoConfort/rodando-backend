@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { TypeOrmModuleOptions, TypeOrmOptionsFactory } from '@nestjs/typeorm';
-import * as path from 'path';
+import { join } from 'path';
 
 @Injectable()
 export class DatabaseConfigService implements TypeOrmOptionsFactory {
@@ -10,44 +10,49 @@ export class DatabaseConfigService implements TypeOrmOptionsFactory {
   createTypeOrmOptions(): TypeOrmModuleOptions {
     const nodeEnv = this.configService.get<string>('NODE_ENV', 'development');
     const isProd = nodeEnv === 'production';
-    // Flag en .env para controlar migraciones
-    const runMigrations = this.configService.get<boolean>(
-      'RUN_MIGRATIONS',
-      false,
-    );
 
-    const migrationsDir = isProd
-      ? join(__dirname, '../dist/migrations/*{.js,.js.map}')
-      : join(__dirname, '../src/database/migrations/*{.ts,.js}');
+    const databaseUrl = this.configService.get<string>('DATABASE_URL');
+
+    const runMigrations =
+      this.configService.get<string>('RUN_MIGRATIONS', 'false') === 'true';
+
+    const dbLogging =
+      this.configService.get<string>('DB_LOGGING', 'false') === 'true';
+
+    const dbSynchronize =
+      !isProd && this.configService.get<string>('DB_SYNCHRONIZE', 'false') === 'true';
+
+    const migrationsGlob = isProd
+      ? join(__dirname, '..', 'migrations', '*.js')
+      : join(__dirname, '..', 'migrations', '*.ts');
+
+    const sslEnabled =
+      this.configService.get<string>('DB_SSL', 'false') === 'true';
+
+    const base: TypeOrmModuleOptions = {
+      type: 'postgres',
+      synchronize: dbSynchronize,
+      logging: dbLogging,
+      autoLoadEntities: true,
+      migrationsRun: runMigrations,
+      migrations: [migrationsGlob],
+      migrationsTableName: 'migrations_history',
+      ...(sslEnabled ? { ssl: { rejectUnauthorized: false } } : {}),
+    };
+
+    if (databaseUrl) {
+      return { ...base, url: databaseUrl };
+    }
 
     return {
-      type: 'postgres',
+      ...base,
       host: this.configService.get<string>('DB_HOST'),
-      port: +this.configService.get<string>('DB_PORT', '5432'),
+      port: Number(this.configService.get<string>('DB_PORT', '5432')),
       username: this.configService.get<string>('DB_USER'),
       password: this.configService.get<string>('DB_PASSWORD'),
       database: this.configService.get<string>('DB_NAME'),
-
-      // Nunca uses synchronize en prod
-      synchronize:
-        !isProd && this.configService.get<boolean>('DB_SYNCHRONIZE', false),
-
-      logging: this.configService.get<boolean>('DB_LOGGING', false),
-      autoLoadEntities: true,
-
-      // Ejecuta migraciones al arrancar solo si lo habilitas
-      migrationsRun: runMigrations,
-      migrations: [migrationsDir],
-      migrationsTableName: 'migrations_history',
-
-      // Habilita el CLI para generar nuevas migraciones:
-      //   cli: {
-      //     migrationsDir: 'src/migrations',
-      //   },
     };
   }
 }
 
-function join(...paths: string[]): string {
-  return path.join(...paths);
-}
+

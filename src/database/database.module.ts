@@ -13,41 +13,65 @@ import { DatabaseInitService } from './database-init/database-init.service';
 @Module({})
 export class DatabaseModule {
   static forRoot(): DynamicModule {
+    const nodeEnv = process.env.NODE_ENV ?? 'development';
+    const isProd = nodeEnv === 'production';
+
     return {
       module: DatabaseModule,
       imports: [
-        // Configuración global de variables de entorno
         ConfigModule.forRoot({
           isGlobal: true,
-          envFilePath: '.env',
+
+          // En Render no hay .env: usas env vars del dashboard.
+          // Local: puedes usar .env.development / .env.production (NO commitearlos)
+          ignoreEnvFile: isProd,
+          envFilePath: !isProd ? [`.env.${nodeEnv}`, '.env'] : undefined,
+
           validationSchema: Joi.object({
-            DB_HOST: Joi.string().required(),
-            DB_PORT: Joi.number().default(5432),
-            DB_USER: Joi.string().required(),
-            DB_PASSWORD: Joi.string().required(),
-            DB_NAME: Joi.string().required(),
-            DB_DEFAULT: Joi.string().default('postgres'),
-            DB_SYNCHRONIZE: Joi.boolean().default(false),
-            DB_LOGGING: Joi.boolean().default(false),
             NODE_ENV: Joi.string()
               .valid('development', 'production', 'test')
               .default('development'),
+
+            // Soporta DATABASE_URL (Render) o variables separadas (local/docker)
+            DATABASE_URL: Joi.string().uri().optional(),
+
+            DB_HOST: Joi.when('DATABASE_URL', {
+              is: Joi.exist(),
+              then: Joi.optional(),
+              otherwise: Joi.required(),
+            }),
+            DB_PORT: Joi.number().default(5432),
+            DB_USER: Joi.when('DATABASE_URL', {
+              is: Joi.exist(),
+              then: Joi.optional(),
+              otherwise: Joi.required(),
+            }),
+            DB_PASSWORD: Joi.when('DATABASE_URL', {
+              is: Joi.exist(),
+              then: Joi.optional(),
+              otherwise: Joi.required(),
+            }),
+            DB_NAME: Joi.when('DATABASE_URL', {
+              is: Joi.exist(),
+              then: Joi.optional(),
+              otherwise: Joi.required(),
+            }),
+
+            DB_DEFAULT: Joi.string().default('postgres'),
+
+            DB_SYNCHRONIZE: Joi.boolean().default(false),
+            DB_LOGGING: Joi.boolean().default(false),
+
+            RUN_MIGRATIONS: Joi.boolean().default(false),
+            DB_AUTO_CREATE: Joi.boolean().default(false),
+            DB_SSL: Joi.boolean().default(false),
           }),
         }),
 
-        // Inicialización asíncrona de TypeORM
         TypeOrmModule.forRootAsync({
           imports: [ConfigModule],
-          inject: [ConfigService, DatabaseInitService],
-          useFactory: async (
-            configService: ConfigService,
-            initService: DatabaseInitService,
-          ): Promise<
-            ReturnType<DatabaseConfigService['createTypeOrmOptions']>
-          > => {
-            // Asegura que la base exista antes de arrancar TypeORM
-
-            await initService.ensureDatabaseExists();
+          inject: [ConfigService],
+          useFactory: async (configService: ConfigService) => {
             return new DatabaseConfigService(
               configService,
             ).createTypeOrmOptions();
@@ -55,7 +79,7 @@ export class DatabaseModule {
         }),
       ],
       providers: [DatabaseConfigService, DatabaseInitService],
-      exports: [TypeOrmModule, DatabaseInitService],
+      exports: [TypeOrmModule],
     };
   }
 }
