@@ -521,53 +521,45 @@ export class DriverAvailabilityService {
    * - si está online, re-evalúa elegibilidad ⇒ set is_available_for_trips & reason
    */
   async onTripEnded(
-    driverId: string,
-    currentVehicleId: string | null,
-    manager?: EntityManager,
-  ): Promise<void> {
-    // 1) Lock (consistencia)
-    const av = await this.driverAvailabilityRepo.lockDriverForUpdate(
-      driverId,
-      manager,
-    );
-    if (!av) return;
+  driverId: string,
+  currentVehicleId: string | null,
+  manager?: EntityManager,
+): Promise<DriverAvailabilityResponseDto | null> {
 
-    // 2) Limpiar el current_trip_id con el método del repo (NO uses updateStatusByDriverId para esto)
-    await this.driverAvailabilityRepo.clearCurrentTripByDriverId(
-      driverId,
-      manager,
-    );
+  const av = await this.driverAvailabilityRepo.lockDriverForUpdate(driverId, manager);
+  if (!av) return null;
 
-    // 3) Recalcular flags de disponibilidad
-    let isAvailableForTrips = false;
-    let reason: AvailabilityReason | null = AvailabilityReason.OFFLINE;
+  await this.driverAvailabilityRepo.clearCurrentTripByDriverId(driverId, manager);
 
-    if (av.isOnline) {
-      const { ok } = await this.checkOperationalEligibility(
-        driverId,
-        currentVehicleId,
-        manager,
-      );
-      isAvailableForTrips = !!ok;
-      reason = ok ? null : AvailabilityReason.UNAVAILABLE;
-    } else {
-      isAvailableForTrips = false;
-      reason = AvailabilityReason.OFFLINE;
-    }
+  let isAvailableForTrips = false;
+  let reason: AvailabilityReason | null = AvailabilityReason.OFFLINE;
 
-    // 4) Actualizar SOLO los campos permitidos por updateStatusByDriverId
-    await this.driverAvailabilityRepo.updateStatusByDriverId(
-      driverId,
-      {
-        isOnline: av.isOnline,
-        isAvailableForTrips,
-        availabilityReason: reason,
-        lastPresenceTimestamp: new Date(),
-        // <- NO currentTripId aquí
-      },
-      manager,
-    );
+  if (av.isOnline) {
+    const { ok } = await this.checkOperationalEligibility(driverId, currentVehicleId, manager);
+    isAvailableForTrips = !!ok;
+    reason = ok ? null : AvailabilityReason.UNAVAILABLE;
+  } else {
+    isAvailableForTrips = false;
+    reason = AvailabilityReason.OFFLINE;
   }
+
+  await this.driverAvailabilityRepo.updateStatusByDriverId(
+    driverId,
+    {
+      isOnline: av.isOnline,
+      isAvailableForTrips,
+      availabilityReason: reason,
+      lastPresenceTimestamp: new Date(),
+    },
+    manager,
+  );
+
+  // 🔥 IMPORTANTE: re-leer para garantizar currentTripId=null en el snapshot
+  const fresh = await this.driverAvailabilityRepo.findByDriverId(driverId, [], manager);
+  if (!fresh) return null;
+
+  return toDriverAvailabilityResponseDto(fresh);
+}
 
   // ****
 
@@ -746,22 +738,78 @@ export class DriverAvailabilityService {
 
   // STATUS (online/available/reason)
   async updateStatus(
-    driverId: string,
-    dto: UpdateDriverStatusDto,
-  ): Promise<DriverAvailabilityResponseDto> {
-    const saved = await this.driverAvailabilityRepo.updateStatusByDriverId(
-      driverId,
-      dto,
-    );
-    const snapshot = toDriverAvailabilityResponseDto(saved);
+  driverId: string,
+  dto: UpdateDriverStatusDto,
+): Promise<DriverAvailabilityResponseDto> {
+  const saved = await this.dataSource.transaction(async (manager) => {
+    // 1) lock row
+    const av = await this.driverAvailabilityRepo.lockDriverForUpdate(driverId, manager);
+    if (!av) {
+      throw new NotFoundException(`DriverAvailability for ${driverId} not found`);
+    }
 
-    this.eventEmitter.emit(DriverAvailabilityEvents.StatusUpdated, {
-      at: new Date().toISOString(),
-      snapshot,
-    } as StatusUpdatedEvent);
+    const isOnTrip = !!av.currentTripId;
 
-    return snapshot;
-  }
+    // 2) Intención (si piden available=true, asumimos online=true aunque no venga)
+    const wantsOnline =
+      dto.isOnline ?? (dto.isAvailableForTrips === true ? true : av.isOnline);
+
+    const clientExplicitNoAvailable = dto.isAvailableForTrips === false;
+
+    const now = new Date();
+
+    const patch: Partial<DriverAvailability> = {
+      isOnline: wantsOnline,
+      lastPresenceTimestamp: now,
+    };
+
+    // si transiciona OFFLINE -> ONLINE, actualiza lastOnlineTimestamp
+    if (wantsOnline && !av.isOnline) {
+      patch.lastOnlineTimestamp = now;
+    }
+
+    // 3) Reglas canónicas
+    if (isOnTrip) {
+      // estando en trip, NO puede quedar disponible
+      patch.isOnline = true; // recomendado: si está en trip, está "online"
+      patch.isAvailableForTrips = false;
+      patch.availabilityReason = AvailabilityReason.ON_TRIP;
+    } else if (!wantsOnline) {
+      patch.isAvailableForTrips = false;
+      patch.availabilityReason = AvailabilityReason.OFFLINE;
+    } else {
+      // wantsOnline === true y NO está en trip => evaluar elegibilidad
+      const elig = await this.checkOperationalEligibility(
+        driverId,
+        av.currentVehicleId ?? null,
+        manager,
+      );
+
+      if (!elig.ok) {
+        patch.isAvailableForTrips = false;
+        patch.availabilityReason = AvailabilityReason.UNAVAILABLE;
+      } else {
+        // online + elegible => available=true (a menos que cliente pida explícitamente false)
+        patch.isAvailableForTrips = clientExplicitNoAvailable ? false : true;
+        patch.availabilityReason = patch.isAvailableForTrips
+          ? null
+          : AvailabilityReason.UNAVAILABLE;
+      }
+    }
+
+    // 4) Persistir (NO uses dto directo; usamos patch canónico)
+    return this.driverAvailabilityRepo.updateStatusByDriverId(driverId, patch, manager);
+  });
+
+  const snapshot = toDriverAvailabilityResponseDto(saved);
+
+  this.eventEmitter.emit(DriverAvailabilityEvents.StatusUpdated, {
+    at: new Date().toISOString(),
+    snapshot,
+  } as StatusUpdatedEvent);
+
+  return snapshot;
+}
 
   async markOnlineFromLogin(driverId: string, atIso: string) {
     await this.driverAvailabilityRepo.ensureForDriver(driverId, {});
@@ -881,6 +929,20 @@ export class DriverAvailabilityService {
       this.logger.debug(`Event emit failed (${eventName})`, e);
     }
   }
+
+ emitStatusUpdated(snapshot: DriverAvailabilityResponseDto, at: string) {
+  this.eventEmitter.emit(DriverAvailabilityEvents.StatusUpdated, {
+    at,
+    snapshot,
+  } as StatusUpdatedEvent);
+}
+
+emitTripUpdated(snapshot: DriverAvailabilityResponseDto, at: string) {
+  this.eventEmitter.emit(DriverAvailabilityEvents.TripUpdated, {
+    at,
+    snapshot,
+  } as TripUpdatedEvent);
+}
 }
 
 // ----------------- helpers de mapeo ----------------
@@ -929,3 +991,4 @@ function toDriverAvailabilityResponseDto(
     deletedAt: toISO((da as any).deletedAt),
   };
 }
+

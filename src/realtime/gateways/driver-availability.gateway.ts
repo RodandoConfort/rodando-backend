@@ -104,6 +104,10 @@ export class DriverAvailabilityGateway
       this.logger.log(
         `Driver WS connected user=${userId} sid=${sid} nsp=${client.nsp?.name} rooms=[${Rooms.driver(userId)}, session:${sid}]`,
       );
+      this.logger.log(
+  `Driver WS connected id=${client.id} origin=${client.handshake.headers.origin} ua=${client.handshake.headers['user-agent']}`
+);
+this.logger.log(`rooms=${[...client.rooms].join(',')}`);
       client.emit('hello', { ok: true, nsp: '/drivers' });
     } catch (e) {
       this.logger.warn(`Driver WS handshake failed: ${(e as Error).message}`);

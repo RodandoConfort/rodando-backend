@@ -11,7 +11,7 @@ import { SessionRepository } from 'src/modules/auth/repositories/session.reposit
 import { UserRepository } from 'src/modules/user/repositories/user.repository';
 import { UserStatus, UserType } from 'src/modules/user/entities/user.entity';
 
-@WebSocketGateway({ namespace: '/drivers', cors: true })
+@WebSocketGateway({ namespace: '/drivers-auth', cors: true })
 export class DriverAuthGateway
   implements OnGatewayConnection, OnGatewayDisconnect
 {
