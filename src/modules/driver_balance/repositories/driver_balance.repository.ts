@@ -71,6 +71,30 @@ export class DriverBalanceRepository extends Repository<DriverBalance> {
     }
   }
 
+ async getByAuthUserIdOrThrow(
+  userId: string,
+  manager?: EntityManager,
+): Promise<DriverBalance> {
+  const repo = manager ? manager.getRepository(DriverBalance) : this;
+
+  const entity = await repo.findOne({
+    where: { driverId: userId },
+    // relations: { driver: true }, // solo si lo necesitas
+  });
+
+  if (!entity) {
+    throw new NotFoundException(
+      formatErrorResponse(
+        'WALLET_NOT_FOUND',
+        'No existe wallet para el driver autenticado.',
+        { userId },
+      ),
+    );
+  }
+
+  return entity;
+}
+
   /** Lanza 404 si no existe */
   async getByDriverIdOrThrow(driverId: string, manager?: EntityManager) {
     const entity = await this.findByDriverId(driverId, manager);

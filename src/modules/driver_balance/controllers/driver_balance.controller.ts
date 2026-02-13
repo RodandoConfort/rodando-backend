@@ -9,11 +9,13 @@ import {
   Logger,
   ParseUUIDPipe,
   Query,
+  UseGuards,
 } from '@nestjs/common';
 import { DriverBalanceService } from '../services/driver_balance.service';
 import { DriverBalanceDepositDto } from '../../driver_balance/dto/update-driver-balance-deposit.dto';
 import {
   ApiBadRequestResponse,
+  ApiBearerAuth,
   ApiBody,
   ApiConflictResponse,
   ApiCreatedResponse,
@@ -43,6 +45,8 @@ import { PaginationDto } from 'src/common/dto/pagination.dto';
 import { WalletMovementQueryDto } from '../dto/wallet-movements-query.dto';
 import { plainToInstance } from 'class-transformer';
 import { WalletMovementsListResponseDto } from '../dto/wallet-movements-list-response.dto';
+import { JwtAuthGuard } from 'src/modules/auth/guards/jwt-auth.guard';
+import { GetUserId } from 'src/modules/auth/decorators/get-user-id.decorator';
 
 @ApiTags('drivers-balance')
 @Controller('drivers-balance')
@@ -131,6 +135,22 @@ export class DriverBalanceController {
 
     return formatSuccessResponse('Depósito confirmado.', res);
   }
+
+  // ✅ 1) Endpoint para el driver autenticado (NO requiere driverId)
+    @UseGuards(JwtAuthGuard)
+@ApiBearerAuth()
+@Get('me')
+@HttpCode(HttpStatus.OK)
+@ApiOperation({ summary: 'Obtener saldo del wallet del driver autenticado' })
+@ApiOkResponse({ description: 'Saldo obtenido', type: DriverBalanceResponseDto })
+@ApiUnauthorizedResponse({ description: 'Invalid or expired token / No credentials' })
+@ApiNotFoundResponse({ description: 'Wallet no encontrado para el driver autenticado' })
+async getMyWalletBalance(
+  @GetUserId() userId: string,
+): Promise<ApiResponse<DriverBalanceResponseDto>> {
+  const wallet = await this.driverBalanceService.getMyWalletBalance(userId);
+  return formatSuccessResponse('Saldo obtenido.', wallet);
+}
 
   //Obtener saldo del wallet de un driver
   @Public()

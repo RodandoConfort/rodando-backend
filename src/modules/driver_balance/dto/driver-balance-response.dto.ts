@@ -4,7 +4,7 @@ import { Expose } from 'class-transformer';
 export class DriverBalanceResponseDto {
   @Expose()
   @ApiProperty({ example: '8c9a9d43-4aab-4a6d-8c2a-b2e2a2e4e1c0' })
-  id: string;
+  id?: string;
 
   @Expose()
   @ApiProperty({ example: '3a0c239d-7a63-43b2-a9b3-25b0f3a7a2cd' })

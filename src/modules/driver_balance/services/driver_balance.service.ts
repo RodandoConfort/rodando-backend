@@ -651,6 +651,19 @@ export class DriverBalanceService {
     }
   }
 
+  async getMyWalletBalance(userId: string): Promise<DriverBalanceResponseDto> {
+  try {
+    const wallet = await this.repo.getByAuthUserIdOrThrow(userId);
+    return this.toResponseDto(wallet);
+  } catch (error) {
+    throw handleServiceError(
+      this.logger,
+      error,
+      `DriverBalanceService.getMyWalletBalance (userId: ${userId})`,
+    );
+  }
+}
+
   /** Obtener saldo de wallet por driverId (lectura simple, sin lock) */
   async getDriverWalletBalance(
     driverId: string,
