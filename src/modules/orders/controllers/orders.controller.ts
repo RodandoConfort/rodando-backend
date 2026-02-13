@@ -11,6 +11,7 @@ import {
   HttpCode,
   Logger,
   ParseUUIDPipe,
+  UseGuards,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -24,6 +25,7 @@ import {
   ApiQuery,
   ApiParam,
   ApiBody,
+  ApiBearerAuth,
 } from '@nestjs/swagger';
 import { OrdersService } from '../services/orders.service';
 import { CreateOrderDto } from '../dto/create-order.dto';
@@ -45,6 +47,9 @@ import { ImmediateRefundDto } from '../dto/immediate-refund.dto';
 import { NormalRefundDto } from '../dto/order-normal-refund.dto';
 import { CommissionAdjustmentResponseDto } from '../dto/comission-adjustment-response.dto';
 import { AdjustCommissionDto } from '../dto/comission-adjustment.dto';
+import { CreateMyTripCashOrderDto } from '../dto/create-my-trip-cash-order.dto';
+import { JwtAuthGuard } from 'src/modules/auth/guards/jwt-auth.guard';
+import { GetUserId } from 'src/modules/auth/decorators/get-user-id.decorator';
 
 @ApiTags('orders')
 @Controller('orders')
@@ -138,6 +143,36 @@ export class OrdersController {
     );
   }
 
+  // ✅ Driver autenticado: crea order CASH del trip sin ids en body
+@UseGuards(JwtAuthGuard)
+@ApiBearerAuth()
+@Post('me/trips/:tripId/cash')
+@HttpCode(HttpStatus.CREATED)
+async createMyTripCashOrder(
+  @Param('tripId', new ParseUUIDPipe({ version: '4' })) tripId: string,
+  @GetUserId() userId: string,
+  @Body() body: CreateMyTripCashOrderDto,
+) {
+  const { order, created, trip } =
+    await this.ordersService.createCashOrderOnTripClosureAsDriver(tripId, userId, body);
+
+  return formatSuccessResponse(
+    created ? 'Order creada.' : 'Order recuperada (idempotente).',
+    {
+      id: order.id,
+      tripId,
+      passengerId: trip.passenger.id,
+      driverId: trip.driver!.id,
+      requestedAmount: Number(order.requestedAmount).toFixed(2),
+      paymentType: order.paymentType,
+      status: order.status,
+      currency: order.currency || 'CUP',
+      createdAt: order.createdAt.toISOString(),
+      updatedAt: order.updatedAt.toISOString(),
+    },
+  );
+}
+
   // NOTA: si quieres restringir update/delete a roles internos, remueve @Public() y aplica Guards
   @Public()
   @Patch(':id')
@@ -186,6 +221,31 @@ export class OrdersController {
       result as ConfirmCashOrderResponseDto,
     );
   }
+
+//   @UseGuards(JwtAuthGuard)
+// @ApiBearerAuth()
+// @Patch('me/trips/:tripId/confirm-cash')
+// @HttpCode(HttpStatus.OK)
+// @ApiOperation({
+//   summary: 'Driver autenticado → Confirmar CASH de la Order del trip (sin orderId)',
+//   description:
+//     'Busca la order CASH (uq_orders_trip) por tripId, valida ownership (driver autenticado) y confirma idempotente.',
+// })
+// @ApiParam({ name: 'tripId', description: 'UUID del Trip' })
+// @ApiOkResponse({ description: 'Order confirmada o ya confirmada (idempotente)', type: ConfirmCashOrderResponseDto })
+// async confirmMyCashOrderByTrip(
+//   @Param('tripId', new ParseUUIDPipe({ version: '4' })) tripId: string,
+//   @GetUserId() userId: string,
+// ) {
+//   const result = await this.ordersService.confirmCashOrderByTripAsDriver(tripId, userId);
+
+//   return formatSuccessResponse(
+//     result.alreadyPaid
+//       ? 'Order ya estaba pagada (idempotente).'
+//       : 'Order confirmada (PAID) y comisión aplicada.',
+//     result as ConfirmCashOrderResponseDto,
+//   );
+// }
 
   @Public()
   @Delete(':id')

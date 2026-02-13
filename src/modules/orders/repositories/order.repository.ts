@@ -143,6 +143,15 @@ export class OrderRepository extends Repository<Order> {
     }
   }
 
+  async loadAndLockOrderByTripId(tripId: string, manager: EntityManager) {
+  return manager
+    .createQueryBuilder(Order, 'o')
+    .setLock('pessimistic_write')
+    .innerJoin('o.trip', 't')
+    .where('t.id = :tripId', { tripId })
+    .getOne();
+}
+
   async markPaid(
     manager: EntityManager,
     order: Order,

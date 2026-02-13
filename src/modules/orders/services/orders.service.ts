@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -26,7 +27,7 @@ import {
 import { Order, OrderStatus, PaymentType } from '../entities/order.entity';
 import { OrderListItemDto } from '../dto/order-list-item.dto';
 import { OrderDetailDto } from '../dto/order-detail.dto';
-import { Trip } from '../../trip/entities/trip.entity';
+import { PaymentMode, Trip, TripStatus } from '../../trip/entities/trip.entity';
 import { User } from '../../user/entities/user.entity';
 import { ConfirmCashOrderDto } from '../dto/confirm-cash-order.dto';
 import { TransactionRepository } from '../../transactions/repositories/transactions.repository';
@@ -51,6 +52,8 @@ import {
   OrderEventType,
   DomainEvent,
 } from '../interfaces/order-event-types.enum';
+import { CreateMyTripCashOrderDto } from '../dto/create-my-trip-cash-order.dto';
+import { withQueryRunnerTx } from 'src/common/utils/tx.util';
 
 const COMMISSION_RATE = 0.2; // 20% comisión plataforma
 
@@ -208,6 +211,119 @@ export class OrdersService {
     return { order, created };
   }
 
+  // TOdo para cuando implememnte la logica luego
+  async createCashOrderOnTripClosureAsDriver(
+  tripId: string,
+  driverUserId: string,
+  dto: CreateMyTripCashOrderDto,
+) {
+  const amount = toAmount(dto.requestedAmount);
+  if (isNaN(amount)) {
+    throw new BadRequestException(
+      formatErrorResponse(
+        'INVALID_REQUESTED_AMOUNT',
+        'requestedAmount debe ser un decimal positivo.',
+        { requestedAmount: dto.requestedAmount },
+      ),
+    );
+  }
+
+  try {
+    return await withQueryRunnerTx(
+      this.dataSource,
+      async (_qr, manager, afterCommit) => {
+        // 1) cargar + lock trip (dentro de TX)
+        const trip = await manager
+          .createQueryBuilder(Trip, 't')
+          .setLock('pessimistic_write')
+          .leftJoinAndSelect('t.driver', 'driver')
+          .leftJoinAndSelect('t.passenger', 'passenger')
+          .where('t.id = :tripId', { tripId })
+          .getOne();
+
+        if (!trip) {
+          throw new NotFoundException(
+            formatErrorResponse('TRIP_NOT_FOUND', 'Viaje no encontrado.', { tripId }),
+          );
+        }
+
+        // 2) reglas de negocio mínimas (seguras)
+        if (!trip.driver) {
+          throw new BadRequestException(
+            formatErrorResponse('TRIP_NO_DRIVER', 'El viaje aún no tiene driver asignado.', { tripId }),
+          );
+        }
+
+        if (trip.driver.id !== driverUserId) {
+          throw new ForbiddenException(
+            formatErrorResponse('FORBIDDEN', 'No eres el driver de este viaje.', {
+              tripId,
+              actorUserId: driverUserId,
+              tripDriverId: trip.driver.id,
+            }),
+          );
+        }
+
+        if (trip.paymentMode !== PaymentMode.CASH) {
+          throw new BadRequestException(
+            formatErrorResponse('INVALID_PAYMENT_MODE', 'Este viaje no es CASH.', {
+              tripId,
+              paymentMode: trip.paymentMode,
+            }),
+          );
+        }
+
+        if (trip.currentStatus !== TripStatus.COMPLETED) {
+          throw new BadRequestException(
+            formatErrorResponse('INVALID_TRIP_STATUS', 'El viaje no está COMPLETED.', {
+              tripId,
+              status: trip.currentStatus,
+            }),
+          );
+        }
+
+        // 3) crear order idempotente por uq_orders_trip
+        const { order, created } = await this.repo.createPendingForTrip(manager, {
+          tripId,
+          passengerId: trip.passenger.id,
+          driverId: trip.driver.id,
+          requestedAmount: amount,
+          paymentType: PaymentType.CASH,
+        });
+
+        // 4) evento post-commit (si se creó)
+        if (created) {
+          afterCommit(async () => {
+            try {
+              this.events.emit(OrderEventType.CREATED, {
+                orderId: order.id,
+                tripId,
+                passengerId: trip.passenger.id,
+                driverId: trip.driver!.id,
+                requestedAmount: amount,
+                paymentType: PaymentType.CASH,
+                currency: order.currency,
+                createdAt: new Date().toISOString(),
+              });
+            } catch (e) {
+              this.logger?.error?.('Failed to emit order.created', e);
+            }
+          });
+        }
+
+        return { order, created, trip };
+      },
+      { logLabel: `OrderService.createCashOrderOnTripClosureAsDriver ${tripId}` },
+    );
+  } catch (error) {
+    throw handleServiceError(
+      this.logger,
+      error,
+      `OrderService.createCashOrderOnTripClosureAsDriver ${tripId}`,
+    );
+  }
+}
+
   /**
    * Variante idempotente: si la Order ya estaba PAID, vuelve a aplicar
    * la comisión de forma idempotente y retorna alreadyPaid=true.
@@ -356,6 +472,114 @@ export class OrdersService {
       );
     }
   }
+
+  async confirmCashOrderTx(
+  manager: EntityManager,
+  orderId: string,
+  dto: ConfirmCashOrderDto,
+  postCommitEvents: Array<{ name: string; payload: any }> = [],
+) {
+  // 1) Lock + cargar order sin relaciones (usando el MISMO manager)
+  const order = await this.repo.loadAndLockOrder(orderId, manager);
+  if (!order) {
+    throw new NotFoundException(
+      formatErrorResponse('ORDER_NOT_FOUND', 'Orden no encontrada.', { orderId }),
+    );
+  }
+
+  // 1.1) Asegura CASH
+  if (order.paymentType !== PaymentType.CASH) {
+    throw new BadRequestException(
+      formatErrorResponse(
+        'INVALID_PAYMENT_TYPE',
+        'confirmCashOrderTx procesa únicamente órdenes CASH.',
+        { orderId, paymentType: order.paymentType },
+      ),
+    );
+  }
+
+  // 2) Cargar relaciones necesarias
+  const fullOrder = await this.repo.findWithRelations(
+    order.id,
+    ['trip', 'passenger', 'driver'],
+    undefined,
+    manager,
+  );
+  if (!fullOrder) {
+    throw new NotFoundException(
+      formatErrorResponse('ORDER_NOT_FOUND', 'Orden no encontrada tras lock.', { orderId }),
+    );
+  }
+
+  // 2) Cálculos
+  const gross = _roundTo2(Number(fullOrder.requestedAmount));
+  const commission = gross * COMMISSION_RATE;
+  const net = _roundTo2(gross - commission);
+  if (net < 0) {
+    throw new BadRequestException(
+      formatErrorResponse('NEGATIVE_NET', 'La comisión no puede exceder el monto bruto.', {
+        gross,
+        commission,
+        net,
+      }),
+    );
+  }
+
+  // 3) TRANSACTION CHARGE (idempotente)
+  await this.txRepo.createOrGetChargeForOrder(manager, {
+    orderId: fullOrder.id,
+    tripId: fullOrder.trip.id,
+    passengerId: fullOrder.passenger.id,
+    driverId: fullOrder.driver.id,
+    gross,
+    commission,
+    net,
+    currency: fullOrder.currency ?? 'CUP',
+    description: 'trip charge (cash)',
+  });
+
+  // 4) Comisión al wallet (idempotente)
+  const applied = await this.walletsService.applyCashTripCommission(
+    fullOrder.driver.id,
+    {
+      tripId: fullOrder.trip.id,
+      orderId: fullOrder.id,
+      commissionAmount: commission.toFixed(2),
+      platformFeeAmount: COMMISSION_RATE,
+      currency: fullOrder.currency ?? 'CUP',
+      grossAmount: gross.toFixed(2),
+      note: 'cash trip commission',
+    } as any,
+    manager,
+  );
+
+  if ((applied as any)?.eventsToEmit) {
+    postCommitEvents.push(...(applied as any).eventsToEmit);
+  }
+
+  // 5) Marcar PAID (idempotente)
+  const alreadyPaid = order.status === OrderStatus.PAID; // mejor que 'paid'
+  const updated = await this.repo.markPaid(manager, fullOrder, dto.confirmedByUserId);
+
+  // 6) Respuesta
+  return {
+    orderId: updated.id,
+    tripId: updated.trip.id,
+    driverId: updated.driver.id,
+    passengerId: updated.passenger.id,
+    paymentType: updated.paymentType,
+    status: updated.status,
+    paidAt: (updated.paidAt ?? new Date()).toISOString(),
+    confirmedBy: updated.confirmedBy!,
+    commissionAmount: commission.toFixed(2),
+    currency: updated.currency,
+    commissionTransactionId: applied.tx.id,
+    walletMovementId: applied.movement.id,
+    previousBalance: Number(applied.movement.previousBalance).toFixed(2),
+    newBalance: Number(applied.movement.newBalance).toFixed(2),
+    alreadyPaid,
+  };
+}
 
   // ------------------------------
   // FIND ALL (paginated)
