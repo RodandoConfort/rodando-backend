@@ -51,6 +51,7 @@ import { EstimateTripDto } from '../dtos/trip/estimate-trip.dto';
 import { TripQuoteDto } from '../dtos/trip/trip-quote.dto';
 import { IdempotencyKeyRepository } from 'src/modules/core-settings/repositories/idempotency-key.repository';
 import { PricingEngineService } from 'src/modules/settings/price-policies/services/pricing-engine.service';
+import { DriverAvailabilityResponseDto } from 'src/modules/drivers-availability/dtos/driver-availability-response.dto';
 
 @Injectable()
 export class TripService {
@@ -1147,180 +1148,207 @@ export class TripService {
   }
 
   async completeTrip(
-    tripId: string,
-    dto: {
-      driverId: string;
-      actualDistanceKm?: number | null;
-      actualDurationMin?: number | null;
-      extraFees?: number | null;
-      waitingTimeMinutes?: number | null;
-      waitingReason?: string | null;
-    },
-  ): Promise<ApiResponseDto<TripResponseDto>> {
-    const now = new Date();
-    let paymentMode!: PaymentMode;
-    let driverIdFixed!: string;
-    let completedFareTotal!: number;
-    let completedCurrency!: string;
+  tripId: string,
+  dto: {
+    driverId: string;
+    actualDistanceKm?: number | null;
+    actualDurationMin?: number | null;
+    extraFees?: number | null;
+    waitingTimeMinutes?: number | null;
+    waitingReason?: string | null;
+  },
+): Promise<ApiResponseDto<TripResponseDto>> {
+  const now = new Date();
+  let paymentMode!: PaymentMode;
+  let driverIdFixed!: string;
+  let completedFareTotal!: number;
+  let completedCurrency!: string;
 
-    await withQueryRunnerTx(
-      this.dataSource,
-      async (_qr, manager) => {
-        // 1) Lock minimalista: status + driver
-        const lock = await this.tripRepo.getStatusAndDriverForUpdate(
-          tripId,
-          manager,
-        );
-        if (!lock) throw new NotFoundException('Trip not found');
+  // ✅ NUEVO: guardamos snapshot “fresh” de availability para emitir después del commit
+  let availabilitySnapshot: DriverAvailabilityResponseDto | null = null;
 
-        if (lock.status !== TripStatus.IN_PROGRESS) {
-          throw new ConflictException(`Trip must be 'in_progress' to complete`);
-        }
-        if (!lock.driverId || lock.driverId !== dto.driverId) {
-          throw new BadRequestException('Driver not assigned / mismatched');
-        }
+  await withQueryRunnerTx(
+    this.dataSource,
+    async (_qr, manager, afterCommit) => {
+      // 1) Lock minimalista: status + driver
+      const lock = await this.tripRepo.getStatusAndDriverForUpdate(tripId, manager);
+      if (!lock) throw new NotFoundException('Trip not found');
 
-        // 2) Trip completo para pricing, snapshot, availability
-        const t = await this.tripRepo.findByIdWithPricing(tripId, manager);
-        if (!t) throw new NotFoundException('Trip not found (after lock)');
+      if (lock.status !== TripStatus.IN_PROGRESS) {
+        throw new ConflictException(`Trip must be 'in_progress' to complete`);
+      }
+      if (!lock.driverId || lock.driverId !== dto.driverId) {
+        throw new BadRequestException('Driver not assigned / mismatched');
+      }
 
-        // 3) Distancia/tiempo reales o fallback
-        let dKm = dto.actualDistanceKm ?? t.fareDistanceKm ?? null;
-        let dMin = dto.actualDurationMin ?? t.fareDurationMin ?? null;
+      // 2) Trip completo para pricing, snapshot, availability
+      const t = await this.tripRepo.findByIdWithPricing(tripId, manager);
+      if (!t) throw new NotFoundException('Trip not found (after lock)');
 
-        if (dKm == null || dMin == null) {
-          const stops = await this.tripStopsRepo.findByTripOrdered(
-            tripId,
+      // 3) Distancia/tiempo reales o fallback
+      let dKm = dto.actualDistanceKm ?? t.fareDistanceKm ?? null;
+      let dMin = dto.actualDurationMin ?? t.fareDurationMin ?? null;
+
+      if (dKm == null || dMin == null) {
+        const stops = await this.tripStopsRepo.findByTripOrdered(tripId, manager);
+        const points = [t.pickupPoint as any, ...stops.map((s) => s.point as any)];
+
+        const metrics = this.pricing.estimateRouteMetrics(points as any);
+        dKm = dKm ?? metrics.distanceKm;
+        dMin = dMin ?? metrics.durationMin;
+      }
+
+      // 4) Pricing final (incluye extras / espera)
+      const final = await this.pricing.computeFinalForCompletion(
+        t,
+        Number(dKm),
+        Number(dMin),
+        dto.extraFees ?? null,
+        {
+          waitingTimeMinutes: dto.waitingTimeMinutes ?? null,
+          waitingReason: dto.waitingReason ?? null,
+        },
+        manager,
+      );
+
+      // Guardamos para el evento de dominio
+      completedFareTotal = final.fareTotal;
+      completedCurrency = final.currency;
+
+      // 5) Persistir cierre en trips
+      await this.tripRepo.completeTrip(
+        tripId,
+        {
+          distanceKm: final.distanceKm,
+          durationMin: final.durationMin,
+          fareTotal: final.fareTotal,
+          surgeMultiplier: final.surgeMultiplier,
+          breakdown: final.breakdown,
+          completedAt: now,
+        },
+        manager,
+      );
+
+      // 6) Snapshot inmutable (best-effort)
+      try {
+        if (this.tripSnapshotRepo && t.driver && t.vehicle) {
+          await this.tripSnapshotRepo.upsertForTrip(
+            {
+              tripId: t.id,
+              driverName: (t.driver as any)?.name ?? 'Driver',
+              driverPhone: (t.driver as any)?.phoneNumber ?? null,
+              vehicleMake: (t.vehicle as any)?.make ?? '',
+              vehicleModel: (t.vehicle as any)?.model ?? '',
+              vehicleColor: (t.vehicle as any)?.color ?? null,
+              vehiclePlate: (t.vehicle as any)?.plateNumber ?? '',
+              serviceClassName:
+                t.requestedServiceClass?.name ??
+                (t as any).requestedServiceClass?.name ??
+                'Standard',
+            },
             manager,
           );
-          const points = [
-            t.pickupPoint as any,
-            ...stops.map((s) => s.point as any),
-          ];
-
-          const metrics = this.pricing.estimateRouteMetrics(points as any); // ✅ limpio
-          dKm = dKm ?? metrics.distanceKm;
-          dMin = dMin ?? metrics.durationMin;
         }
+      } catch {}
 
-        // 4) Pricing final (incluye extras / espera)
-        const final = await this.pricing.computeFinalForCompletion(
-          t,
-          Number(dKm),
-          Number(dMin),
-          dto.extraFees ?? null,
-          {
-            waitingTimeMinutes: dto.waitingTimeMinutes ?? null,
-            waitingReason: dto.waitingReason ?? null,
-          },
-          manager,
-        );
+      // 7) Availability ✅ CAMBIO: capturamos el snapshot fresh
+      availabilitySnapshot = await this.availabilityService.onTripEnded(
+        lock.driverId,
+        t.vehicle?.id ?? null,
+        manager,
+      );
 
-        // Guardamos para el evento de dominio
-        completedFareTotal = final.fareTotal;
-        completedCurrency = final.currency;
+      // 8) Event store
+      await this.tripEventsRepo.append(
+        tripId,
+        TripEventType.TRIP_COMPLETED,
+        now,
+        {
+          driver_id: lock.driverId,
+          fare_total: final.fareTotal,
+          currency: final.currency,
+          waiting_time_minutes: dto.waitingTimeMinutes ?? null,
+          extra_fees: dto.extraFees ?? null,
+          waiting_reason: dto.waitingReason ?? null,
+        },
+        manager,
+      );
 
-        // 5) Persistir cierre en trips
-        await this.tripRepo.completeTrip(
-          tripId,
-          {
-            distanceKm: final.distanceKm,
-            durationMin: final.durationMin,
-            fareTotal: final.fareTotal,
-            surgeMultiplier: final.surgeMultiplier,
-            breakdown: final.breakdown,
-            completedAt: now,
-          },
-          manager,
-        );
+      driverIdFixed = lock.driverId;
+      paymentMode = t.paymentMode;
 
-        // 6) Snapshot inmutable (best-effort)
-        try {
-          if (this.tripSnapshotRepo && t.driver && t.vehicle) {
-            await this.tripSnapshotRepo.upsertForTrip(
-              {
-                tripId: t.id,
-                driverName: (t.driver as any)?.name ?? 'Driver',
-                driverPhone: (t.driver as any)?.phoneNumber ?? null,
-                vehicleMake: (t.vehicle as any)?.make ?? '',
-                vehicleModel: (t.vehicle as any)?.model ?? '',
-                vehicleColor: (t.vehicle as any)?.color ?? null,
-                vehiclePlate: (t.vehicle as any)?.plateNumber ?? '',
-                serviceClassName:
-                  t.requestedServiceClass?.name ??
-                  (t as any).requestedServiceClass?.name ??
-                  'Standard',
-              },
-              manager,
-            );
-          }
-        } catch {}
+      // 9) Orden CASH dentro de la TX (si aplica)
+      if (paymentMode === PaymentMode.CASH) {
+  const { order } = await this.orderService.createCashOrderOnTripClosureTx(
+    manager,
+    tripId,
+    { currencyDefault: final.currency },
+  );
 
-        // 7) Availability
-        await this.availabilityService.onTripEnded(
-          lock.driverId,
-          t.vehicle?.id ?? null,
-          manager,
-        );
+  // ✅ Confirmar en la MISMA TX (sin abrir transaction nueva)
+  const postCommitEvents: Array<{ name: string; payload: any }> = [];
 
-        // 8) Event store
-        await this.tripEventsRepo.append(
-          tripId,
-          TripEventType.TRIP_COMPLETED,
-          now,
-          {
-            driver_id: lock.driverId,
-            fare_total: final.fareTotal,
-            currency: final.currency,
-            waiting_time_minutes: dto.waitingTimeMinutes ?? null,
-            extra_fees: dto.extraFees ?? null,
-            waiting_reason: dto.waitingReason ?? null,
-          },
-          manager,
-        );
+  await this.orderService.confirmCashOrderTx(
+    manager,
+    order.id,
+    { confirmedByUserId: lock.driverId, commissionAmount: '0' as any }, // o dto.driverId (ya validaste que coincide)
+    postCommitEvents,
+  );
 
-        driverIdFixed = lock.driverId;
-        paymentMode = t.paymentMode;
-
-        // 9) Orden CASH dentro de la TX (si aplica)
-        if (paymentMode === PaymentMode.CASH) {
-          await this.orderService.createCashOrderOnTripClosureTx(
-            manager,
-            tripId,
-            { currencyDefault: final.currency },
+  // ✅ Emitir eventos solo después del commit (idéntico patrón al que ya usas)
+  if (postCommitEvents.length > 0) {
+    afterCommit(async () => {
+      try {
+        for (const ev of postCommitEvents) {
+          this.events.emit(ev.name, ev.payload);
+          this.logger.debug(
+            `Post-commit event: ${ev.name} -> ${JSON.stringify(ev.payload)}`,
           );
         }
-      },
-      { logLabel: 'trip.complete' },
-    );
-
-    // 10) Domain event → WS (incluyendo precio final)
-    this.events.emit(TripDomainEvents.TripCompleted, {
-      at: now.toISOString(),
-      tripId,
-      driverId: driverIdFixed,
-      fareTotal: completedFareTotal,
-      currency: completedCurrency,
-    } as TripCompletedEvent);
-
-    // 11) Respuesta HTTP con trip fresco
-    const full = await this.tripRepo.findById(tripId, {
-      relations: {
-        passenger: true,
-        driver: true,
-        vehicle: true,
-        requestedVehicleCategory: true,
-        requestedServiceClass: true,
-        estimateVehicleType: true,
-      },
+      } catch (emitErr) {
+        this.logger.error('Failed to emit post-commit events', emitErr);
+      }
     });
-
-    return {
-      success: true,
-      message: 'Trip completed',
-      data: toTripResponseDto(full!),
-    };
   }
+}
+    },
+    { logLabel: 'trip.complete' },
+  );
+
+  // ✅ NUEVO: emitir StatusUpdated DESPUÉS del commit
+  if (availabilitySnapshot) {
+  const at = now.toISOString();
+  this.availabilityService.emitStatusUpdated(availabilitySnapshot, at);
+  this.availabilityService.emitTripUpdated(availabilitySnapshot, at); // 👈 clave para limpiar currentTripId en tiempo real
+}
+
+  // 10) Domain event → WS (incluyendo precio final)
+  this.events.emit(TripDomainEvents.TripCompleted, {
+    at: now.toISOString(),
+    tripId,
+    driverId: driverIdFixed,
+    fareTotal: completedFareTotal,
+    currency: completedCurrency,
+  } as TripCompletedEvent);
+
+  // 11) Respuesta HTTP con trip fresco
+  const full = await this.tripRepo.findById(tripId, {
+    relations: {
+      passenger: true,
+      driver: true,
+      vehicle: true,
+      requestedVehicleCategory: true,
+      requestedServiceClass: true,
+      estimateVehicleType: true,
+    },
+  });
+
+  return {
+    success: true,
+    message: 'Trip completed',
+    data: toTripResponseDto(full!),
+  };
+}
 }
 
 const toLatLng = (geoPoint: any) => ({

@@ -49,8 +49,7 @@ export class TripRealtimePublisher {
       const serverId = String(server as any);
 
       // 🔢 Tamaño del room (rápido, sin promesas)
-      const sizeQuick =
-        (server.sockets as any)?.adapter?.rooms?.get(room)?.size ?? 0;
+      const sizeQuick = (server as any).adapter?.rooms?.get(room)?.size ?? 0;
 
       this.logger.debug(
         `[WS] emitTo[quick] ns=${ns} room=${room} size=${sizeQuick} evt=${event} server=${serverId}`,
@@ -63,6 +62,7 @@ export class TripRealtimePublisher {
         .then((sockets) => {
           this.logger.debug(
             `[WS] emitTo[fetch] ns=${ns} room=${room} clients=${sockets.length} evt=${event} server=${serverId}`,
+            `[WS] sockets in room=${room}: ${sockets.map(s => `${s.id}|${s.handshake.address}|${s.handshake.headers?.origin}`).join(' ; ')}`
           );
         })
         .catch(() => {
@@ -298,8 +298,7 @@ export class TripRealtimePublisher {
       const serverId = String(server as any);
 
       // 🔢 Tamaño rápido del room (sin promesas)
-      const sizeQuick =
-        (server.sockets as any)?.adapter?.rooms?.get(room)?.size ?? 0;
+      const sizeQuick = (server as any).adapter?.rooms?.get(room)?.size ?? 0;
       this.logger.debug(
         `[WS] emitDriverAcceptedToPassenger[quick] room=${room} size=${sizeQuick} trip=${p.tripId} server=${serverId}`,
       );
