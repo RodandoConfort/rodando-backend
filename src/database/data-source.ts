@@ -24,6 +24,9 @@ const { value: env, error } = schema.validate(process.env);
 if (error) throw new Error(`Config validation error: ${error.message}`);
 
 const isProd = env.NODE_ENV === 'production';
+const root = process.cwd();
+
+const sslOptions = env.DB_SSL ? { rejectUnauthorized: false } : undefined;
 
 const dataSource = new DataSource({
   type: 'postgres',
@@ -36,20 +39,26 @@ const dataSource = new DataSource({
         password: env.DB_PASSWORD,
         database: env.DB_NAME,
       }),
-  ...(env.DB_SSL ? { ssl: { rejectUnauthorized: false } } : {}),
+
+  // ✅ Neon/cloud cuando DB_SSL=true
+  ...(sslOptions ? { ssl: sslOptions } : {}),
+  extra: sslOptions ? { ssl: sslOptions } : undefined, // ✅ pg a veces respeta más extra.ssl
+
   logging: env.DB_LOGGING,
   synchronize: false,
 
+  // ✅ Rutas robustas (no dependen de __dirname)
   entities: [
     isProd
-      ? join(__dirname, '**', '*.entity.js')
-      : join(__dirname, 'src', '**', '*.entity.ts'),
+      ? join(root, 'dist', '**', '*.entity.js')
+      : join(root, 'src', '**', '*.entity.ts'),
   ],
   migrations: [
     isProd
-      ? join(__dirname, 'database', 'migrations', '*.js')
-      : join(__dirname, 'src', 'database', 'migrations', '*.ts'),
+      ? join(root, 'dist', 'database', 'migrations', '*.js')
+      : join(root, 'src', 'database', 'migrations', '*.ts'),
   ],
+
   migrationsRun: env.RUN_MIGRATIONS,
   migrationsTableName: 'migrations_history',
 });

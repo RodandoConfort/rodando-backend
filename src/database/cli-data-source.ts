@@ -17,29 +17,29 @@ const { value: env, error } = schema.validate(process.env);
 if (error) throw new Error(`Config validation error: ${error.message}`);
 
 const isProd = env.NODE_ENV === 'production';
+const root = process.cwd();
+
+const sslOptions = env.DB_SSL ? { rejectUnauthorized: false } : undefined;
 
 const dataSource = new DataSource({
   type: 'postgres',
   url: env.DATABASE_URL,
 
-  // ✅ Render external suele requerir SSL
-  ...(env.DB_SSL ? { ssl: { rejectUnauthorized: false } } : {}),
+  ...(sslOptions ? { ssl: sslOptions } : {}),
+  extra: sslOptions ? { ssl: sslOptions } : undefined,
 
   logging: env.DB_LOGGING,
   synchronize: false,
 
-  // ✅ Tu proyecto: entidades están en src/** y en dist/**
   entities: [
     isProd
-      ? join(__dirname, '..', '**', '*.entity.js')  // dist/**
-      : join(__dirname, '..', '**', '*.entity.ts'), // src/**
+      ? join(root, 'dist', '**', '*.entity.js')
+      : join(root, 'src', '**', '*.entity.ts'),
   ],
-
-  // ✅ Migraciones están en src/database/migrations
   migrations: [
     isProd
-      ? join(__dirname, 'migrations', '*.js') // dist/database/migrations
-      : join(__dirname, 'migrations', '*.ts'), // src/database/migrations
+      ? join(root, 'dist', 'database', 'migrations', '*.js')
+      : join(root, 'src', 'database', 'migrations', '*.ts'),
   ],
 
   migrationsTableName: 'migrations_history',
