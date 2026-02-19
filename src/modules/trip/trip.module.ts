@@ -22,6 +22,10 @@ import { OrdersModule } from '../orders/orders.module';
 import { AssignmentExpiryScheduler } from './services/assignment-expiry.scheduler';
 import { CoreSettingsModule } from '../core-settings/core-settings.module';
 import { PricePolicyModule } from '../settings/price-policies/price-policy.module';
+import { SavedLocation } from './entities/saved-locations.entity';
+import { SavedLocationController } from './controllers/saved-location.controller';
+import { SavedLocationRepository } from './repositories/saved-location.repository';
+import { SavedLocationService } from './services/saved-location.service';
 
 @Module({
   imports: [
@@ -33,6 +37,7 @@ import { PricePolicyModule } from '../settings/price-policies/price-policy.modul
       TripEvent,
       TripStop,
       TripSnapshot,
+      SavedLocation,
     ]),
     EventEmitterModule,
     CoreSettingsModule,
@@ -40,7 +45,7 @@ import { PricePolicyModule } from '../settings/price-policies/price-policy.modul
     OrdersModule,
     PricePolicyModule,
   ],
-  controllers: [TripController],
+  controllers: [TripController, SavedLocationController],
   providers: [
     TripService,
     TripRepository,
@@ -51,6 +56,8 @@ import { PricePolicyModule } from '../settings/price-policies/price-policy.modul
     MatchingDomainGuards,
     TripSnapshotRepository,
     AssignmentExpiryScheduler,
+    SavedLocationRepository,
+    SavedLocationService,
   ],
   exports: [TripRepository, TripService, AssignmentExpiryScheduler],
 })
