@@ -26,6 +26,7 @@ import { SavedLocation } from './entities/saved-locations.entity';
 import { SavedLocationController } from './controllers/saved-location.controller';
 import { SavedLocationRepository } from './repositories/saved-location.repository';
 import { SavedLocationService } from './services/saved-location.service';
+import { TripHistoryService } from './services/trip-history.service';
 
 @Module({
   imports: [
@@ -58,6 +59,7 @@ import { SavedLocationService } from './services/saved-location.service';
     AssignmentExpiryScheduler,
     SavedLocationRepository,
     SavedLocationService,
+    TripHistoryService
   ],
   exports: [TripRepository, TripService, AssignmentExpiryScheduler],
 })
