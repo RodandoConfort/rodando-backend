@@ -43,11 +43,34 @@ import { JwtAuthGuard } from 'src/modules/auth/guards/jwt-auth.guard';
 import { GetUserId } from 'src/modules/auth/decorators/get-user-id.decorator';
 import { EstimateTripDto } from '../dtos/trip/estimate-trip.dto';
 import { TripQuoteDto } from '../dtos/trip/trip-quote.dto';
+import { TripHistoryQueryDto } from '../dtos/history/trip-history-query.dto';
+import { TripHistoryPassengerItemDto } from '../dtos/history/trip-history-passenger-item.dto';
+import { TripHistoryDriverItemDto } from '../dtos/history/trip-history-driver-item.dto';
+import { TripHistoryService } from '../services/trip-history.service';
 
 @ApiTags('trips')
 @Controller('trips')
 export class TripController {
-  constructor(private readonly tripService: TripService) {}
+  constructor(private readonly tripService: TripService, private readonly tripHistoryService: TripHistoryService) {}
+
+  /** Historial del usuario autenticado (auto: passenger vs driver) */
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @Get('history')
+  @ApiOperation({ summary: 'Get trip history for authenticated user (passenger/driver)' })
+  @ApiOkResponse({ type: ApiResponseDto })
+  getMyHistory(
+    @GetUserId() userId: string,
+    @Query() q: TripHistoryQueryDto,
+  ): Promise<
+    ApiResponseDto<
+      Array<TripHistoryPassengerItemDto | TripHistoryDriverItemDto>,
+      PaginationMetaDto
+    >
+  > {
+    return this.tripHistoryService.getMyHistory(userId, q);
+  }
+
 
   /** Detalle puntual del trip */
   @Get(':id')

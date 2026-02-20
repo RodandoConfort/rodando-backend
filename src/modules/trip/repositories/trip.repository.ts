@@ -14,6 +14,8 @@ import { FareBreakdown } from 'src/common/interfaces/fare-breakdown.interface';
 import { TripListItemProjection } from '../interfaces/trip.interfaces';
 import { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { VehicleType } from 'src/modules/vehicle-types/entities/vehicle-types.entity';
+import { TripStop } from '../entities/trip-stop.entity';
+import { TripHistoryDriverProjection, TripHistoryPassengerProjection } from '../dtos/history/trip-history.projections';
 
 export interface PaginationDto {
   page?: number;
@@ -24,6 +26,8 @@ export interface PaginationDto {
 export const TRIP_RELATIONS = ['passenger', 'driver', 'vehicle'] as const;
 // si tienes la relación a la orden, agrégala: 'order'
 export type TripRelation = (typeof TRIP_RELATIONS)[number];
+
+const SNAP_TABLE = 'trip_snapshots';
 
 @Injectable()
 export class TripRepository extends BaseRepository<Trip> {
@@ -723,6 +727,218 @@ export class TripRepository extends BaseRepository<Trip> {
         'countWithFilters',
         this.entityName,
       );
+    }
+  }
+
+  // Funciones para el historial de viajes
+  private finalStatuses(): TripStatus[] {
+    return [TripStatus.COMPLETED, TripStatus.CANCELLED, TripStatus.NO_DRIVERS_FOUND];
+  }
+
+  private buildLastStopSubquery() {
+    // DISTINCT ON (trip_id) … ORDER BY trip_id, seq DESC  => último stop por viaje
+    return this.manager
+      .getRepository(TripStop)
+      .createQueryBuilder('ts')
+      .select('ts.tripId', 'tripId')
+      .addSelect('ts.address', 'address')
+      .addSelect(`ST_AsGeoJSON(ts.point)::json`, 'point')
+      .distinctOn(['ts.tripId'])
+      .orderBy('ts.tripId', 'ASC')
+      .addOrderBy('ts.seq', 'DESC');
+  }
+
+  private buildStopsCountSubquery() {
+    return this.manager
+      .getRepository(TripStop)
+      .createQueryBuilder('sc')
+      .select('sc.tripId', 'tripId')
+      .addSelect('COUNT(*)', 'stopsCount')
+      .groupBy('sc.tripId');
+  }
+
+  private applyHistoryFilters(
+    qb: SelectQueryBuilder<Trip>,
+    filters?: { status?: TripStatus; requestedFrom?: Date; requestedTo?: Date },
+  ) {
+    // siempre historial: estados finales
+    qb.andWhere('t.currentStatus IN (:...finalSt)', { finalSt: this.finalStatuses() });
+
+    if (filters?.status) {
+      // permite filtrar dentro de los finales
+      qb.andWhere('t.currentStatus = :st', { st: filters.status });
+    }
+    if (filters?.requestedFrom) qb.andWhere('t.requestedAt >= :rf', { rf: filters.requestedFrom });
+    if (filters?.requestedTo) qb.andWhere('t.requestedAt <= :rt', { rt: filters.requestedTo });
+  }
+
+  private async countHistory(
+    base: SelectQueryBuilder<Trip>,
+    method: string,
+  ): Promise<number> {
+    try {
+      // ⚠️ Para el count: solo dejamos where/join, sin selects pesados
+      const qb = base.clone();
+      qb.select('t.id');
+      qb.orderBy(); // limpiar orderBy para count
+      return await qb.getCount();
+    } catch (err) {
+      handleRepositoryError(this.logger, err, method, this.entityName);
+      throw err;
+    }
+  }
+
+  /**
+   * Historial para PASAJERO (muestra driver/vehículo vía snapshot)
+   */
+  async findPassengerHistoryPaginatedProjection(
+    passengerId: string,
+    pagination: PaginationDto,
+    filters?: { status?: TripStatus; requestedFrom?: Date; requestedTo?: Date },
+  ): Promise<[TripHistoryPassengerProjection[], number]> {
+    const { page = 1, limit = 10 } = pagination;
+
+    const lastStopSub = this.buildLastStopSubquery();
+    const stopsCountSub = this.buildStopsCountSubquery();
+
+    const qb = this.qb('t')
+      .leftJoin('t.passenger', 'p')
+      .leftJoin(`(${lastStopSub.getQuery()})`, 'ls', `ls."tripId" = t._id`)
+      .leftJoin(`(${stopsCountSub.getQuery()})`, 'sc', `sc."tripId" = t._id`)
+      .leftJoin(SNAP_TABLE, 'snap', 'snap.trip_id = t._id')
+      .where('p.id = :pid', { pid: passengerId })
+      .select([
+        't._id AS id',
+        't.current_status AS "currentStatus"',
+        't.payment_mode AS "paymentMode"',
+
+        't.requested_at AS "requestedAt"',
+        't.accepted_at AS "acceptedAt"',
+        't.started_at AS "startedAt"',
+        't.completed_at AS "completedAt"',
+        't.canceled_at AS "canceledAt"',
+
+        't.pickup_address AS "pickupAddress"',
+        `ST_AsGeoJSON(t.pickup_point)::json AS "pickupPoint"`,
+
+        'ls.address AS "dropoffAddress"',
+        'ls.point AS "dropoffPoint"',
+
+        'COALESCE(sc."stopsCount", 0)::int AS "stopsCount"',
+
+        't.fare_final_currency AS currency',
+        't.fare_estimated_total AS "fareEstimatedTotal"',
+        't.fare_total AS "fareTotal"',
+        't.fare_distance_km AS "distanceKm"',
+        't.fare_duration_min AS "durationMin"',
+
+        't.order_id AS "orderId"',
+
+        'snap.driver_name AS "driverName"',
+        'snap.driver_phone AS "driverPhone"',
+        'snap.vehicle_make AS "vehicleMake"',
+        'snap.vehicle_model AS "vehicleModel"',
+        'snap.vehicle_color AS "vehicleColor"',
+        'snap.vehicle_plate AS "vehiclePlate"',
+        'snap.service_class_name AS "serviceClassName"',
+      ])
+      .setParameters(lastStopSub.getParameters())
+      .setParameters(stopsCountSub.getParameters())
+      .orderBy('t.requestedAt', 'DESC');
+
+    this.applyHistoryFilters(qb, filters);
+    this.paginate(qb as any, page, limit);
+
+    try {
+      const [rows, total] = await Promise.all([
+        qb.getRawMany<TripHistoryPassengerProjection>(),
+        this.countHistory(
+          this.qb('t').leftJoin('t.passenger', 'p').where('p.id = :pid', { pid: passengerId }).andWhere('t.currentStatus IN (:...finalSt)', { finalSt: this.finalStatuses() }),
+          'countPassengerHistory',
+        ),
+      ]);
+      return [rows, total];
+    } catch (err) {
+      handleRepositoryError(this.logger, err, 'findPassengerHistoryPaginatedProjection', this.entityName);
+      throw err;
+    }
+  }
+
+  /**
+   * Historial para DRIVER (muestra pasajero, + vehículo via snapshot)
+   */
+  async findDriverHistoryPaginatedProjection(
+    driverId: string,
+    pagination: PaginationDto,
+    filters?: { status?: TripStatus; requestedFrom?: Date; requestedTo?: Date },
+  ): Promise<[TripHistoryDriverProjection[], number]> {
+    const { page = 1, limit = 10 } = pagination;
+
+    const lastStopSub = this.buildLastStopSubquery();
+    const stopsCountSub = this.buildStopsCountSubquery();
+
+    const qb = this.qb('t')
+      .leftJoin('t.driver', 'd')
+      .leftJoin('t.passenger', 'p')
+      .leftJoin(`(${lastStopSub.getQuery()})`, 'ls', `ls."tripId" = t._id`)
+      .leftJoin(`(${stopsCountSub.getQuery()})`, 'sc', `sc."tripId" = t._id`)
+      .leftJoin(SNAP_TABLE, 'snap', 'snap.trip_id = t._id')
+      .where('d.id = :did', { did: driverId })
+      .select([
+        't._id AS id',
+        't.current_status AS "currentStatus"',
+        't.payment_mode AS "paymentMode"',
+
+        't.requested_at AS "requestedAt"',
+        't.accepted_at AS "acceptedAt"',
+        't.started_at AS "startedAt"',
+        't.completed_at AS "completedAt"',
+        't.canceled_at AS "canceledAt"',
+
+        't.pickup_address AS "pickupAddress"',
+        `ST_AsGeoJSON(t.pickup_point)::json AS "pickupPoint"`,
+
+        'ls.address AS "dropoffAddress"',
+        'ls.point AS "dropoffPoint"',
+
+        'COALESCE(sc."stopsCount", 0)::int AS "stopsCount"',
+
+        't.fare_final_currency AS currency',
+        't.fare_estimated_total AS "fareEstimatedTotal"',
+        't.fare_total AS "fareTotal"',
+        't.fare_distance_km AS "distanceKm"',
+        't.fare_duration_min AS "durationMin"',
+
+        't.order_id AS "orderId"',
+
+        'p.name AS "passengerName"',
+        'p.phoneNumber AS "passengerPhone"',
+
+        'snap.vehicle_make AS "vehicleMake"',
+        'snap.vehicle_model AS "vehicleModel"',
+        'snap.vehicle_color AS "vehicleColor"',
+        'snap.vehicle_plate AS "vehiclePlate"',
+        'snap.service_class_name AS "serviceClassName"',
+      ])
+      .setParameters(lastStopSub.getParameters())
+      .setParameters(stopsCountSub.getParameters())
+      .orderBy('t.requestedAt', 'DESC');
+
+    this.applyHistoryFilters(qb, filters);
+    this.paginate(qb as any, page, limit);
+
+    try {
+      const [rows, total] = await Promise.all([
+        qb.getRawMany<TripHistoryDriverProjection>(),
+        this.countHistory(
+          this.qb('t').leftJoin('t.driver', 'd').where('d.id = :did', { did: driverId }).andWhere('t.currentStatus IN (:...finalSt)', { finalSt: this.finalStatuses() }),
+          'countDriverHistory',
+        ),
+      ]);
+      return [rows, total];
+    } catch (err) {
+      handleRepositoryError(this.logger, err, 'findDriverHistoryPaginatedProjection', this.entityName);
+      throw err;
     }
   }
 }
